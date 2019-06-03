@@ -286,12 +286,6 @@ object KyuubiSparkUtil extends Logging {
     conf.set("spark.hadoop.hive.cluster.delegation.token.store.class",
       "org.apache.hadoop.hive.thrift.MemoryTokenStore")
 
-    conf.getOption(METASTORE_JARS) match {
-      case None | Some("builtin") =>
-      case _ =>
-        conf.set(METASTORE_JARS, "builtin")
-        info(s"Kyuubi prefer $METASTORE_JARS to be builtin ones")
-    }
     // Set missing Kyuubi configs to SparkConf
     KyuubiConf.getAllDefaults.foreach(kv => conf.setIfMissing(kv._1, kv._2))
 
