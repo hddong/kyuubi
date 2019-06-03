@@ -20,13 +20,12 @@ package org.apache.spark.sql.hive.client
 import java.net.URL
 
 import scala.util.Try
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
+import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.{KyuubiSparkUtil, SparkConf}
 import org.apache.spark.sql.internal.NonClosableMutableURLClassLoader
 import org.apache.spark.util.MutableURLClassLoader
-
 import yaooqinn.kyuubi.Logging
 
 /**
@@ -40,6 +39,14 @@ private[hive] object IsolatedClientLoader {
     case "1.0" | "1.0.0" => hive.v1_0
     case "1.1" | "1.1.0" => hive.v1_1
     case "1.2" | "1.2.0" | "1.2.1" | "1.2.2" => hive.v1_2
+    case "2.0" | "2.0.0" | "2.0.1" => hive.v2_0
+    case "2.1" | "2.1.0" | "2.1.1" => hive.v2_1
+    case "2.2" | "2.2.0" => hive.v2_2
+    case "2.3" | "2.3.0" | "2.3.1" | "2.3.2" | "2.3.3" | "2.3.4" => hive.v2_3
+    case "3.1" | "3.1.0" | "3.1.1" => hive.v3_1
+    case version =>
+      throw new UnsupportedOperationException(s"Unsupported Hive Metastore version ($version). " +
+        s"Please set ${HiveUtils.HIVE_METASTORE_VERSION.key} with a valid version.")
   }
 }
 
