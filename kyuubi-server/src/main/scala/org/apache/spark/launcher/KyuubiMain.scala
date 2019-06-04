@@ -70,6 +70,7 @@ object KyuubiMain {
         |                \/__/
       """.stripMargin
     // scalastyle:off
+    cmd.asScala.foreach(printStream.println)
     printStream.println(msg)
     printStream.println("=" * 69)
     printStream.println("Kyuubi Command: " + join(" ", cmd))

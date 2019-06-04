@@ -17,7 +17,10 @@
 
 package org.apache.spark.sql.hive.client
 
-import java.net.URL
+import java.net.{URL, URLClassLoader}
+import java.util
+
+import org.apache.commons.io.IOUtils
 
 import scala.util.Try
 import org.apache.hadoop.conf.Configuration
@@ -64,8 +67,25 @@ private[hive] class IsolatedClientLoader(
 
   import KyuubiSparkUtil._
 
+  protected def allJars = execJars.toArray
+
   // Check to make sure that the root classloader does not know about Hive.
   assert(Try(rootClassLoader.loadClass("org.apache.hadoop.hive.conf.HiveConf")).isFailure)
+
+  protected def isSharedClass(name: String): Boolean = {
+    val isHadoopClass =
+      name.startsWith("org.apache.hadoop.") && !name.startsWith("org.apache.hadoop.hive.")
+
+    name.contains("slf4j") ||
+      name.contains("log4j") ||
+      name.startsWith("org.apache.spark.") ||
+      (sharesHadoopClasses && isHadoopClass) ||
+      name.startsWith("scala.") ||
+      (name.startsWith("com.google") && !name.startsWith("com.google.cloud")) ||
+      name.startsWith("java.lang.") ||
+      name.startsWith("java.net") ||
+      sharedPrefixes.exists(name.startsWith)
+  }
 
   /**
    * (Kent Yao) Different with Spark internal which use an isolated classloader to support different
@@ -85,8 +105,49 @@ private[hive] class IsolatedClientLoader(
    * instead of stacking a new URLClassLoader on top of it.
    */
   private[hive] val classLoader: MutableURLClassLoader = {
-    new MutableURLClassLoader(Array.empty, baseClassLoader)
+    val isolatedClassLoader =
+      if (isolationOn) {
+        new URLClassLoader(allJars, rootClassLoader) {
+          override def loadClass(name: String, resolve: Boolean): Class[_] = {
+            val loaded = findLoadedClass(name)
+            if (loaded == null) doLoadClass(name, resolve) else loaded
+          }
+          def doLoadClass(name: String, resolve: Boolean): Class[_] = {
+            val classFileName = name.replaceAll("\\.", "/") + ".class"
+            if (isBarrierClass(name)) {
+              // For barrier classes, we construct a new copy of the class.
+              val bytes = IOUtils.toByteArray(baseClassLoader.getResourceAsStream(classFileName))
+              defineClass(name, bytes, 0, bytes.length)
+            } else if (!isSharedClass(name)) {
+              super.loadClass(name, resolve)
+            } else {
+              // For shared classes, we delegate to baseClassLoader, but fall back in case the
+              // class is not found.
+              try {
+                baseClassLoader.loadClass(name)
+              } catch {
+                case _: ClassNotFoundException =>
+                  super.loadClass(name, resolve)
+              }
+            }
+          }
+        }
+      } else {
+        baseClassLoader
+      }
+    // Right now, we create a URLClassLoader that gives preference to isolatedClassLoader
+    // over its own URLs when it loads classes and resources.
+    // We may want to use ChildFirstURLClassLoader based on
+    // the configuration of spark.executor.userClassPathFirst, which gives preference
+    // to its own URLs over the parent class loader (see Executor's createClassLoader method).
+    new MutableURLClassLoader(Array.empty, isolatedClassLoader)
   }
+
+  /** True if `name` refers to a spark class that must see specific version of Hive. */
+  protected def isBarrierClass(name: String): Boolean =
+    name.startsWith(classOf[HiveClientImpl].getName) ||
+      name.startsWith(classOf[Shim].getName) ||
+      barrierPrefixes.exists(name.startsWith)
 
   private[hive] def addJar(path: URL): Unit = {
     classLoader.addURL(path)
