@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.hive.client
 
+import java.lang.reflect.{Constructor, InvocationTargetException}
 import java.net.{URL, URLClassLoader}
 import java.util
 
@@ -153,30 +154,64 @@ private[hive] class IsolatedClientLoader(
     classLoader.addURL(path)
   }
 
+  private def getHiveClient(ctor: Constructor[_]): HiveClient = {
+    // Pre-reflective instantiation setup.
+    val origLoader = Thread.currentThread().getContextClassLoader
+    Thread.currentThread.setContextClassLoader(classLoader)
+    try {
+      classLoader
+        .loadClass(classOf[HiveClientImpl].getName)
+        .getConstructors.head
+        .newInstance(version, sparkConf, hadoopConf, config, classLoader, this)
+        .asInstanceOf[HiveClient]
+    } catch {
+      case e: InvocationTargetException =>
+        if (e.getCause().isInstanceOf[NoClassDefFoundError]) {
+          val cnf = e.getCause().asInstanceOf[NoClassDefFoundError]
+          throw new ClassNotFoundException(
+            s"$cnf when creating Hive client using classpath: ${execJars.mkString(", ")}\n" +
+              "Please make sure that jars for your version of hive " +
+              "and hadoop are included in the " +
+              s"paths passed to ${HiveUtils.HIVE_METASTORE_JARS.key}.", e)
+        } else {
+          throw e
+        }
+    } finally {
+      Thread.currentThread.setContextClassLoader(origLoader)
+    }
+  }
+
   /** The isolated client interface to Hive. */
   private[hive] def createClient(): HiveClient = synchronized {
 
     val ctor = classOf[HiveClientImpl].getConstructors.head
     if (majorVersion(SPARK_VERSION) == 2 && minorVersion(SPARK_VERSION) > 3) {
       val warehouseDir = Option(hadoopConf.get(ConfVars.METASTOREWAREHOUSE.varname))
-      ctor.newInstance(
-        version,
-        warehouseDir,
-        sparkConf,
-        hadoopConf,
-        config,
-        classLoader,
-        this).asInstanceOf[HiveClientImpl]
+      if (!isolationOn) {
+        ctor.newInstance(
+          version,
+          warehouseDir,
+          sparkConf,
+          hadoopConf,
+          config,
+          classLoader,
+          this).asInstanceOf[HiveClientImpl]
+      } else {
+        getHiveClient(ctor)
+      }
     } else {
-      ctor.newInstance(
-        version,
-        sparkConf,
-        hadoopConf,
-        config,
-        classLoader,
-        this).asInstanceOf[HiveClientImpl]
+      if (!isolationOn) {
+        ctor.newInstance(
+          version,
+          sparkConf,
+          hadoopConf,
+          config,
+          classLoader,
+          this).asInstanceOf[HiveClientImpl]
+      } else {
+        getHiveClient(ctor)
+      }
     }
-
   }
 
   /**
