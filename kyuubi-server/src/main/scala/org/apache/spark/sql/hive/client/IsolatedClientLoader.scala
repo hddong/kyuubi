@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.hive.client
 
-import java.lang.reflect.{Constructor, InvocationTargetException}
+import java.lang.reflect.InvocationTargetException
 import java.net.{URL, URLClassLoader}
 import java.util
 
@@ -45,33 +45,31 @@ private[hive] object IsolatedClientLoader {
     case "1.2" | "1.2.0" | "1.2.1" | "1.2.2" => hive.v1_2
     case "2.0" | "2.0.0" | "2.0.1" => hive.v2_0
     case "2.1" | "2.1.0" | "2.1.1" => hive.v2_1
-    case "3.0" | "3.0.0" | "3.1" | "3.1.1" | "3.1.2" => hive.v3_0
-    case version =>
-      throw new UnsupportedOperationException(s"Unsupported Hive Metastore version ($version). " +
-        s"Please set ${HiveUtils.HIVE_METASTORE_VERSION.key} with a valid version.")
+    case "3.0" | "3.0.0" => hive.v3_0
   }
 }
 
 private[hive] class IsolatedClientLoader(
-    val version: HiveVersion,
-    val sparkConf: SparkConf,
-    val hadoopConf: Configuration,
-    val execJars: Seq[URL] = Seq.empty,
-    val config: Map[String, String] = Map.empty,
-    val isolationOn: Boolean = true,
-    val sharesHadoopClasses: Boolean = true,
-    val rootClassLoader: ClassLoader = ClassLoader.getSystemClassLoader.getParent.getParent,
-    val baseClassLoader: ClassLoader = Thread.currentThread().getContextClassLoader,
-    val sharedPrefixes: Seq[String] = Seq.empty,
-    val barrierPrefixes: Seq[String] = Seq.empty)
+                                          val version: HiveVersion,
+                                          val sparkConf: SparkConf,
+                                          val hadoopConf: Configuration,
+                                          val execJars: Seq[URL] = Seq.empty,
+                                          val config: Map[String, String] = Map.empty,
+                                          val isolationOn: Boolean = true,
+                                          val sharesHadoopClasses: Boolean = true,
+                                          val rootClassLoader: ClassLoader = ClassLoader.getSystemClassLoader.getParent.getParent,
+                                          val baseClassLoader: ClassLoader = Thread.currentThread().getContextClassLoader,
+                                          val sharedPrefixes: Seq[String] = Seq.empty,
+                                          val barrierPrefixes: Seq[String] = Seq.empty)
   extends Logging {
 
   import KyuubiSparkUtil._
 
-  protected def allJars = execJars.toArray
-
   // Check to make sure that the root classloader does not know about Hive.
   assert(Try(rootClassLoader.loadClass("org.apache.hadoop.hive.conf.HiveConf")).isFailure)
+
+  /** All jars used by the hive specific classloader. */
+  protected def allJars = execJars.toArray
 
   protected def isSharedClass(name: String): Boolean = {
     val isHadoopClass =
@@ -87,6 +85,15 @@ private[hive] class IsolatedClientLoader(
       name.startsWith("java.net") ||
       sharedPrefixes.exists(name.startsWith)
   }
+
+  /** True if `name` refers to a spark class that must see specific version of Hive. */
+  protected def isBarrierClass(name: String): Boolean =
+    name.startsWith(classOf[HiveClientImpl].getName) ||
+      name.startsWith(classOf[Shim].getName) ||
+      barrierPrefixes.exists(name.startsWith)
+
+  protected def classToPath(name: String): String =
+    name.replaceAll("\\.", "/") + ".class"
 
   /**
    * (Kent Yao) Different with Spark internal which use an isolated classloader to support different
@@ -105,6 +112,12 @@ private[hive] class IsolatedClientLoader(
    * So, when we add jar, we can add this new jar directly through the addURL method
    * instead of stacking a new URLClassLoader on top of it.
    */
+  /**
+   * The classloader that is used to load an isolated version of Hive.
+   * This classloader is a special URLClassLoader that exposes the addURL method.
+   * So, when we add jar, we can add this new jar directly through the addURL method
+   * instead of stacking a new URLClassLoader on top of it.
+   */
   private[hive] val classLoader: MutableURLClassLoader = {
     val isolatedClassLoader =
       if (isolationOn) {
@@ -118,12 +131,15 @@ private[hive] class IsolatedClientLoader(
             if (isBarrierClass(name)) {
               // For barrier classes, we construct a new copy of the class.
               val bytes = IOUtils.toByteArray(baseClassLoader.getResourceAsStream(classFileName))
+              info(s"custom defining: $name - ${util.Arrays.hashCode(bytes)}")
               defineClass(name, bytes, 0, bytes.length)
             } else if (!isSharedClass(name)) {
+              info(s"hive class: $name - ${getResource(classToPath(name))}")
               super.loadClass(name, resolve)
             } else {
               // For shared classes, we delegate to baseClassLoader, but fall back in case the
               // class is not found.
+              info(s"shared class: $name")
               try {
                 baseClassLoader.loadClass(name)
               } catch {
@@ -141,23 +157,23 @@ private[hive] class IsolatedClientLoader(
     // We may want to use ChildFirstURLClassLoader based on
     // the configuration of spark.executor.userClassPathFirst, which gives preference
     // to its own URLs over the parent class loader (see Executor's createClassLoader method).
-    new MutableURLClassLoader(Array.empty, isolatedClassLoader)
+    new NonClosableMutableURLClassLoader(isolatedClassLoader)
+//    new MutableURLClassLoader(Array.empty, baseClassLoader)
   }
-
-  /** True if `name` refers to a spark class that must see specific version of Hive. */
-  protected def isBarrierClass(name: String): Boolean =
-    name.startsWith(classOf[HiveClientImpl].getName) ||
-      name.startsWith(classOf[Shim].getName) ||
-      barrierPrefixes.exists(name.startsWith)
 
   private[hive] def addJar(path: URL): Unit = {
     classLoader.addURL(path)
   }
 
-  private def getHiveClient(ctor: Constructor[_]): HiveClient = {
+  /** The isolated client interface to Hive. */
+  private[hive] def createClient(): HiveClient = synchronized {
+    if (!isolationOn) {
+      return new HiveClientImpl(version, sparkConf, hadoopConf, config, baseClassLoader, this)
+    }
     // Pre-reflective instantiation setup.
     val origLoader = Thread.currentThread().getContextClassLoader
     Thread.currentThread.setContextClassLoader(classLoader)
+
     try {
       classLoader
         .loadClass(classOf[HiveClientImpl].getName)
@@ -170,8 +186,7 @@ private[hive] class IsolatedClientLoader(
           val cnf = e.getCause().asInstanceOf[NoClassDefFoundError]
           throw new ClassNotFoundException(
             s"$cnf when creating Hive client using classpath: ${execJars.mkString(", ")}\n" +
-              "Please make sure that jars for your version of hive " +
-              "and hadoop are included in the " +
+              "Please make sure that jars for your version of hive and hadoop are included in the " +
               s"paths passed to ${HiveUtils.HIVE_METASTORE_JARS.key}.", e)
         } else {
           throw e
@@ -180,39 +195,32 @@ private[hive] class IsolatedClientLoader(
       Thread.currentThread.setContextClassLoader(origLoader)
     }
   }
-
-  /** The isolated client interface to Hive. */
-  private[hive] def createClient(): HiveClient = synchronized {
-
-    val ctor = classOf[HiveClientImpl].getConstructors.head
-    if (majorVersion(SPARK_VERSION) == 2 && minorVersion(SPARK_VERSION) > 3) {
-      val warehouseDir = Option(hadoopConf.get(ConfVars.METASTOREWAREHOUSE.varname))
-      if (!isolationOn) {
-        ctor.newInstance(
-          version,
-          warehouseDir,
-          sparkConf,
-          hadoopConf,
-          config,
-          classLoader,
-          this).asInstanceOf[HiveClientImpl]
-      } else {
-        getHiveClient(ctor)
-      }
-    } else {
-      if (!isolationOn) {
-        ctor.newInstance(
-          version,
-          sparkConf,
-          hadoopConf,
-          config,
-          classLoader,
-          this).asInstanceOf[HiveClientImpl]
-      } else {
-        getHiveClient(ctor)
-      }
-    }
-  }
+//
+//  /** The isolated client interface to Hive. */
+//  private[hive] def createClient(): HiveClient = synchronized {
+//
+//    val ctor = classOf[HiveClientImpl].getConstructors.head
+//    if (majorVersion(SPARK_VERSION) == 2 && minorVersion(SPARK_VERSION) > 3) {
+//      val warehouseDir = Option(hadoopConf.get(ConfVars.METASTOREWAREHOUSE.varname))
+//      ctor.newInstance(
+//        version,
+//        warehouseDir,
+//        sparkConf,
+//        hadoopConf,
+//        config,
+//        classLoader,
+//        this).asInstanceOf[HiveClientImpl]
+//    } else {
+//      ctor.newInstance(
+//        version,
+//        sparkConf,
+//        hadoopConf,
+//        config,
+//        classLoader,
+//        this).asInstanceOf[HiveClientImpl]
+//    }
+//
+//  }
 
   /**
    * The place holder for shared Hive client for all the HiveContext sessions (they share an
