@@ -18,7 +18,7 @@
 #
 
 ## a runnable spark binary path
-# export SPARK_HOME=/Users/Kent/Documents/spark
+export SPARK_HOME=/usr/bch/3.0.1/spark
 
 # Find the spark-submit
 if [ -z "$SPARK_HOME" ]; then

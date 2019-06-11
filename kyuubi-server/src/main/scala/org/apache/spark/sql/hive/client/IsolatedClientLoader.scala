@@ -69,7 +69,12 @@ private[hive] class IsolatedClientLoader(
   assert(Try(rootClassLoader.loadClass("org.apache.hadoop.hive.conf.HiveConf")).isFailure)
 
   /** All jars used by the hive specific classloader. */
-  protected def allJars = execJars.toArray
+  val kyuubiJar = System.getenv("KYUUBI_JAR")
+
+  /** All jars used by the hive specific classloader. */
+  protected def allJars = execJars.toArray :+ new URL("file://" + kyuubiJar)
+
+  info("All jars:" + allJars.map(_.toString).mkString("[", ";", "]"))
 
   protected def isSharedClass(name: String): Boolean = {
     val isHadoopClass =
@@ -119,8 +124,11 @@ private[hive] class IsolatedClientLoader(
    * instead of stacking a new URLClassLoader on top of it.
    */
   private[hive] val classLoader: MutableURLClassLoader = {
+    new MutableURLClassLoader(Array.empty, baseClassLoader)
+  }
+
+  private[hive] def classLoaderTest(origLoader: ClassLoader): MutableURLClassLoader = {
     val isolatedClassLoader =
-      if (isolationOn) {
         new URLClassLoader(allJars, rootClassLoader) {
           override def loadClass(name: String, resolve: Boolean): Class[_] = {
             val loaded = findLoadedClass(name)
@@ -141,7 +149,7 @@ private[hive] class IsolatedClientLoader(
               // class is not found.
               info(s"shared class: $name")
               try {
-                baseClassLoader.loadClass(name)
+                origLoader.loadClass(name)
               } catch {
                 case _: ClassNotFoundException =>
                   super.loadClass(name, resolve)
@@ -149,16 +157,13 @@ private[hive] class IsolatedClientLoader(
             }
           }
         }
-      } else {
-        baseClassLoader
-      }
     // Right now, we create a URLClassLoader that gives preference to isolatedClassLoader
     // over its own URLs when it loads classes and resources.
     // We may want to use ChildFirstURLClassLoader based on
     // the configuration of spark.executor.userClassPathFirst, which gives preference
     // to its own URLs over the parent class loader (see Executor's createClassLoader method).
-    new NonClosableMutableURLClassLoader(isolatedClassLoader)
-//    new MutableURLClassLoader(Array.empty, baseClassLoader)
+    new MutableURLClassLoader(Array.empty, isolatedClassLoader)
+    //    new MutableURLClassLoader(Array.empty, baseClassLoader)
   }
 
   private[hive] def addJar(path: URL): Unit = {
@@ -172,10 +177,11 @@ private[hive] class IsolatedClientLoader(
     }
     // Pre-reflective instantiation setup.
     val origLoader = Thread.currentThread().getContextClassLoader
-    Thread.currentThread.setContextClassLoader(classLoader)
+    val classLoaderHear = classLoaderTest(origLoader)
+    Thread.currentThread.setContextClassLoader(classLoaderHear)
 
     try {
-      classLoader
+      classLoaderHear
         .loadClass(classOf[HiveClientImpl].getName)
         .getConstructors.head
         .newInstance(version, sparkConf, hadoopConf, config, classLoader, this)
