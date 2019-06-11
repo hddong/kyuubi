@@ -22,32 +22,14 @@ import java.net.{URL, URLClassLoader}
 import java.util
 
 import org.apache.commons.io.IOUtils
-
-import scala.util.Try
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.hive.conf.HiveConf.ConfVars
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.hive.HiveUtils
-import org.apache.spark.{KyuubiSparkUtil, SparkConf}
-import org.apache.spark.sql.internal.NonClosableMutableURLClassLoader
 import org.apache.spark.util.MutableURLClassLoader
 import yaooqinn.kyuubi.Logging
 
-/**
- * A Hacking Class for [[IsolatedClientLoader]] to be not isolated
- */
-private[hive] object IsolatedClientLoader {
-  def hiveVersion(version: String): HiveVersion = version match {
-    case "12" | "0.12" | "0.12.0" => hive.v12
-    case "13" | "0.13" | "0.13.0" | "0.13.1" => hive.v13
-    case "14" | "0.14" | "0.14.0" => hive.v14
-    case "1.0" | "1.0.0" => hive.v1_0
-    case "1.1" | "1.1.0" => hive.v1_1
-    case "1.2" | "1.2.0" | "1.2.1" | "1.2.2" => hive.v1_2
-    case "2.0" | "2.0.0" | "2.0.1" => hive.v2_0
-    case "2.1" | "2.1.0" | "2.1.1" => hive.v2_1
-    case "3.0" | "3.0.0" => hive.v3_0
-  }
-}
+import scala.util.Try
+
 
 private[hive] class IsolatedClientLoader(
                                           val version: HiveVersion,
@@ -62,8 +44,6 @@ private[hive] class IsolatedClientLoader(
                                           val sharedPrefixes: Seq[String] = Seq.empty,
                                           val barrierPrefixes: Seq[String] = Seq.empty)
   extends Logging {
-
-  import KyuubiSparkUtil._
 
   // Check to make sure that the root classloader does not know about Hive.
   assert(Try(rootClassLoader.loadClass("org.apache.hadoop.hive.conf.HiveConf")).isFailure)
@@ -147,12 +127,7 @@ private[hive] class IsolatedClientLoader(
               // class is not found.
               info(s"shared class: $name")
               try {
-                if (name.startsWith(classOf[IsolatedClientLoader].getName)) {
-                  val isoLoader = new URLClassLoader(Array(new URL("file://" + kyuubiJar)))
-                  isoLoader.loadClass(name)
-                } else {
-                  baseClassLoader.loadClass(name)
-                }
+                baseClassLoader.loadClass(name)
               } catch {
                 case _: ClassNotFoundException =>
                   super.loadClass(name, resolve)
@@ -183,14 +158,6 @@ private[hive] class IsolatedClientLoader(
     }
     // Pre-reflective instantiation setup.
     val origLoader = Thread.currentThread().getContextClassLoader
-    val isoLoader = new URLClassLoader(Array(new URL("file:///usr/bch/3.0.1" +
-      "/spark/kyuubi/lib/kyuubi-server-0.7.0-SNAPSHOT.jar")))
-    val iso = isoLoader.loadClass(classOf[IsolatedClientLoader].getName)
-    info(iso.hashCode())
-    val isLoader2 = new URLClassLoader(Array(new URL("file:///usr/bch/3.0.1" +
-      "/spark/jars/spark-hive_2.11-2.3.0-bc3.0.1.jar")))
-    val iso2 = isLoader2.loadClass(classOf[IsolatedClientLoader].getName)
-    info(iso2.hashCode())
     Thread.currentThread.setContextClassLoader(classLoader)
 
     try {
